@@ -22,7 +22,7 @@ if CLE_PRIVEE_PHANTOM is None:
     print("❌ ERREUR : La variable CLE_PRIVEE_PHANTOM n'est pas définie.")
     exit(1)
 
-MONTANT_USDC = 10
+MONTANT_USDC = 20
 portefeuille = {}
 
 # ==========================================
