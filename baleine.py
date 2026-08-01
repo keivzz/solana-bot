@@ -1,29 +1,40 @@
 import os
-import sys
-sys.stdout.reconfigure(line_buffering=True)
 import time
 import json
 import requests
 import base58
 import threading
+import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from nacl.signing import SigningKey
 
+# Force l'affichage des logs en temps réel (pour Render)
+sys.stdout.reconfigure(line_buffering=True)
+
 # ==========================================
-# 1. CONFIGURATION (variables d'environnement)
+# 1. CONFIGURATION
 # ==========================================
 
-WHALE_ADDRESS = "FneHsyttC7TuJrp1br112nf5NsTNKTuQqhRi6bnXj317"
+# ---- Liste des baleines (tu peux en ajouter d'autres) ----
+WHALE_ADDRESSES = [
+    "FneHsyttC7TuJrp1br112nf5NsTNKTuQqhRi6bnXj317",  # Baleine 1 (l'originale)
+    "GcV9T51UcwskWnqqM67FWJ9SMHKCPS4hMUKqEVEh3CjU",  # Baleine 2 (la nouvelle)
+]
+
+# ---- Ton wallet Phantom ----
 VOTRE_ADRESSE_PHANTOM = "BF9xJASwDX5K3pRpPmFoDHe6RUmtTrMSBZXwHzwqtipt"
-
-# Clé privée lue depuis l'environnement Render
 CLE_PRIVEE_PHANTOM = os.getenv("CLE_PRIVEE_PHANTOM")
 if CLE_PRIVEE_PHANTOM is None:
-    print("❌ ERREUR : La variable CLE_PRIVEE_PHANTOM n'est pas définie.")
+    print("❌ ERREUR : CLE_PRIVEE_PHANTOM non définie.")
     exit(1)
 
-MONTANT_USDC = 20
-portefeuille = {}
+# ---- Montants ----
+MONTANT_USDC = 20            # Montant principal par trade
+ARBITRAGE_MONTANT = 10       # Montant pour tenter l'arbitrage
+ARBITRAGE_SEUIL = 0.012      # 1.2% d'écart minimum pour arbitrer
+
+# ---- Suivi des tokens achetés ----
+portefeuille_global = {}
 
 # ==========================================
 # 2. SERVEUR FACTICE (pour Render)
@@ -36,38 +47,27 @@ class DummyHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is running")
 
 def run_dummy_server():
-    # Utilise le port attribué par Render (ou 10000 par défaut)
     port = int(os.getenv('PORT', 10000))
     server = HTTPServer(('0.0.0.0', port), DummyHandler)
-    print(f"🌐 Serveur factice démarré sur le port {port}")
     server.serve_forever()
 
-# Lance le serveur factice dans un thread séparé (non bloquant)
 threading.Thread(target=run_dummy_server, daemon=True).start()
 
 # ==========================================
 # 3. FONCTIONS DE SWAP (Solana)
 # ==========================================
 
-def execute_swap(token_out, amount_usdt, is_buy=True):
+def swap_solana(token_out, amount_usdt, is_buy=True):
     try:
-        if is_buy:
-            input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC
-            output_mint = token_out
-        else:
-            input_mint = token_out
-            output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC
+        input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" if is_buy else token_out
+        output_mint = token_out if is_buy else "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
-        # 1. Obtenir la route de swap via Jupiter
         quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={int(amount_usdt * 1_000_000)}&slippageBps=500"
-        quote_response = requests.get(quote_url)
-        quote = quote_response.json()
-
+        quote = requests.get(quote_url).json()
         if "error" in quote:
-            print(f"❌ Erreur de route: {quote['error']}")
+            print(f"❌ Erreur quote: {quote['error']}")
             return
 
-        # 2. Construire la transaction de swap
         swap_payload = {
             "quoteResponse": quote,
             "userPublicKey": VOTRE_ADRESSE_PHANTOM,
@@ -81,7 +81,6 @@ def execute_swap(token_out, amount_usdt, is_buy=True):
             print("❌ Données de swap invalides.")
             return
 
-        # 3. Décoder, signer et envoyer la transaction
         tx_bytes = base58.b58decode(swap_data['swapTransaction'])
         private_key_bytes = base58.b58decode(CLE_PRIVEE_PHANTOM)
         signing_key = SigningKey(private_key_bytes[:32])
@@ -89,18 +88,16 @@ def execute_swap(token_out, amount_usdt, is_buy=True):
         signed_tx = tx_bytes + signature
         signed_tx_base58 = base58.b58encode(signed_tx).decode()
 
-        rpc_url = "https://api.mainnet-beta.solana.com"
-        payload = {
+        rpc_payload = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "sendTransaction",
             "params": [signed_tx_base58, {"encoding": "base58"}]
         }
-        response = requests.post(rpc_url, json=payload)
-        result = response.json()
+        result = requests.post("https://api.mainnet-beta.solana.com", json=rpc_payload).json()
 
         if 'result' in result:
-            print(f"✅ {'Achat' if is_buy else 'Vente'} réussi ! Signature: {result['result']}")
+            print(f"✅ {'Achat' if is_buy else 'Vente'} réussi ! Sig: {result['result'][:16]}...")
         else:
             print(f"❌ Erreur RPC: {result}")
 
@@ -108,59 +105,90 @@ def execute_swap(token_out, amount_usdt, is_buy=True):
         print(f"⚠️ Erreur swap: {e}")
 
 # ==========================================
-# 4. SURVEILLANCE DE LA BALEINE
+# 4. ARBITRAGE (exploite les écarts de prix entre DEX)
 # ==========================================
 
-def check_whale():
-    global portefeuille
+def arbitrage_dex(token_address, amount_usdt):
     try:
-        url = f"https://api.dexscreener.com/latest/dex/tokens/{WHALE_ADDRESS}"
-        response = requests.get(url)
-        data = response.json()
+        print(f"🔄 Tentative d'arbitrage sur {token_address[:12]}...")
+        quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&outputMint={token_address}&amount={int(amount_usdt * 1_000_000)}&slippageBps=100"
+        quote = requests.get(quote_url).json()
 
-        if 'trades' in data and len(data['trades']) > 0:
-            trade = data['trades'][0]
-            side = trade['side']
-            token = trade['tokenAddress']
-            volume = float(trade['volume'])
+        if 'routePlan' not in quote:
+            return
 
-            # Ignorer les micro-mouvements
-            if volume < 50:
-                return
+        dex_prices = {}
+        for route in quote['routePlan']:
+            dex_id = route['swapInfo']['ammKey']
+            price = route['swapInfo']['price']
+            dex_prices[dex_id] = float(price)
 
-            if side == 'BUY':
-                print(f"🔍 Baleine ACHÈTE {token} (Volume: {volume})")
-                if token not in portefeuille:
-                    print(f"💰 Achat de {MONTANT_USDC} USDC sur {token}...")
-                    execute_swap(token, MONTANT_USDC, is_buy=True)
-                    portefeuille[token] = True
-                else:
-                    print("⏳ Token déjà en portefeuille, on ignore.")
+        if len(dex_prices) < 2:
+            print("⚠️ Pas assez de DEX pour l'arbitrage.")
+            return
 
-            elif side == 'SELL':
-                print(f"🔍 Baleine VEND {token} (Volume: {volume})")
-                if token in portefeuille:
-                    print(f"💸 Vente du token {token}...")
-                    execute_swap(token, MONTANT_USDC, is_buy=False)
-                    del portefeuille[token]
-                else:
-                    print("⏳ Token non détenu, on ignore.")
+        min_price = min(dex_prices.values())
+        max_price = max(dex_prices.values())
+        spread = (max_price - min_price) / min_price
+
+        if spread > ARBITRAGE_SEUIL:
+            print(f"💰 Spread {spread:.2%} détecté ! Gain potentiel : {amount_usdt * spread:.2f} USDC")
+            # Pour un arbitrage réel, il faudrait deux transactions signées.
+            # Ici, on le signale pour que tu saches qu'une opportunité existe.
         else:
-            print("⏳ Aucun achat récent.")
+            print(f"⏳ Spread {spread:.2%} < seuil ({ARBITRAGE_SEUIL*100:.1f}%), pas d'arbitrage.")
 
     except Exception as e:
-        print(f"⚠️ Erreur scan: {e}")
+        print(f"⚠️ Erreur arbitrage: {e}")
 
 # ==========================================
-# 5. BOUCLE PRINCIPALE
+# 5. SURVEILLANCE DES BALEINES
+# ==========================================
+
+def check_whale(whale_address):
+    global portefeuille_global
+    try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{whale_address}"
+        data = requests.get(url).json()
+
+        if 'trades' not in data or len(data['trades']) == 0:
+            return
+
+        trade = data['trades'][0]
+        side = trade['side']
+        token = trade['tokenAddress']
+        volume = float(trade['volume'])
+
+        if volume < 50:
+            return
+
+        if side == 'BUY' and token not in portefeuille_global:
+            print(f"🐋 {whale_address[:8]}... ACHÈTE {token[:12]} (Vol: {volume:.0f})")
+            swap_solana(token, MONTANT_USDC, is_buy=True)
+            portefeuille_global[token] = True
+            # Lance l'arbitrage juste après l'achat
+            arbitrage_dex(token, ARBITRAGE_MONTANT)
+
+        elif side == 'SELL' and token in portefeuille_global:
+            print(f"🐋 {whale_address[:8]}... VEND {token[:12]} (Vol: {volume:.0f})")
+            swap_solana(token, MONTANT_USDC, is_buy=False)
+            del portefeuille_global[token]
+
+    except Exception as e:
+        print(f"⚠️ Erreur scan {whale_address[:8]}: {e}")
+
+# ==========================================
+# 6. BOUCLE PRINCIPALE
 # ==========================================
 
 if __name__ == "__main__":
-    print("🚀 BOT BALEINE AUTO (ACHAT + VENTE) - SANS CLÉ EN CLAIR")
-    print(f"🎯 Cible: {WHALE_ADDRESS}")
+    print("🚀 BOT MULTI-BALEINES + ARBITRAGE LANCÉ")
+    print(f"🎯 {len(WHALE_ADDRESSES)} baleines surveillées")
     print(f"💰 Montant par trade: {MONTANT_USDC} USDC")
-    print("🔄 Vérification toutes les 20 secondes...\n")
+    print(f"🔄 Arbitrage: {ARBITRAGE_MONTANT} USDC (seuil {ARBITRAGE_SEUIL*100:.1f}%)")
+    print("🔄 Vérification toutes les 15 secondes...\n")
 
     while True:
-        check_whale()
-        time.sleep(20)
+        for whale in WHALE_ADDRESSES:
+            check_whale(whale)
+        time.sleep(15)
