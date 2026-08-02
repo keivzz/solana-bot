@@ -15,25 +15,21 @@ sys.stdout.reconfigure(line_buffering=True)
 # 1. CONFIGURATION
 # ==========================================
 
-# ---- Liste des baleines (tu peux en ajouter d'autres) ----
 WHALE_ADDRESSES = [
-    "FneHsyttC7TuJrp1br112nf5NsTNKTuQqhRi6bnXj317",  # Baleine 1 (l'originale)
-    "GcV9T51UcwskWnqqM67FWJ9SMHKCPS4hMUKqEVEh3CjU",  # Baleine 2 (la nouvelle)
+    "FneHsyttC7TuJrp1br112nf5NsTNKTuQqhRi6bnXj317",
+    "GcV9T51UcwskWnqqM67FWJ9SMHKCPS4hMUKqEVEh3CjU",
 ]
 
-# ---- Ton wallet Phantom ----
 VOTRE_ADRESSE_PHANTOM = "BF9xJASwDX5K3pRpPmFoDHe6RUmtTrMSBZXwHzwqtipt"
 CLE_PRIVEE_PHANTOM = os.getenv("CLE_PRIVEE_PHANTOM")
 if CLE_PRIVEE_PHANTOM is None:
     print("❌ ERREUR : CLE_PRIVEE_PHANTOM non définie.")
     exit(1)
 
-# ---- Montants ----
-MONTANT_USDC = 20            # Montant principal par trade
-ARBITRAGE_MONTANT = 10       # Montant pour tenter l'arbitrage
-ARBITRAGE_SEUIL = 0.012      # 1.2% d'écart minimum pour arbitrer
+MONTANT_USDC = 20
+ARBITRAGE_MONTANT = 10
+ARBITRAGE_SEUIL = 0.012
 
-# ---- Suivi des tokens achetés ----
 portefeuille_global = {}
 
 # ==========================================
@@ -54,7 +50,44 @@ def run_dummy_server():
 threading.Thread(target=run_dummy_server, daemon=True).start()
 
 # ==========================================
-# 3. FONCTIONS DE SWAP (Solana)
+# 3. PING AUTOMATIQUE (anti-veille Render)
+# ==========================================
+
+def self_ping():
+    """Envoie une requête à son propre service toutes les 5 minutes."""
+    url = "https://solana-bot-4jom.onrender.com"  # à ajuster si ton URL change
+    while True:
+        try:
+            requests.get(url, timeout=5)
+            print("💓 Ping envoyé pour éviter la veille.")
+        except:
+            pass
+        time.sleep(300)  # 5 minutes
+
+threading.Thread(target=self_ping, daemon=True).start()
+
+# ==========================================
+# 4. FONCTION DE REQUÊTE ROBUSTE
+# ==========================================
+
+def requete_robuste(url, max_retries=3, delay=10):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    for i in range(max_retries):
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                return response.json()
+            else:
+                print(f"⚠️ Statut HTTP {response.status_code}, tentative {i+1}/{max_retries}")
+        except Exception as e:
+            print(f"⚠️ Erreur requête (tentative {i+1}/{max_retries}): {e}")
+        time.sleep(delay)
+    return None
+
+# ==========================================
+# 5. FONCTIONS DE SWAP
 # ==========================================
 
 def swap_solana(token_out, amount_usdt, is_buy=True):
@@ -63,9 +96,9 @@ def swap_solana(token_out, amount_usdt, is_buy=True):
         output_mint = token_out if is_buy else "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
         quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={int(amount_usdt * 1_000_000)}&slippageBps=500"
-        quote = requests.get(quote_url).json()
-        if "error" in quote:
-            print(f"❌ Erreur quote: {quote['error']}")
+        quote = requete_robuste(quote_url)
+        if quote is None or "error" in quote:
+            print(f"❌ Erreur quote: {quote.get('error', 'inconnue') if quote else 'timeout'}")
             return
 
         swap_payload = {
@@ -105,16 +138,14 @@ def swap_solana(token_out, amount_usdt, is_buy=True):
         print(f"⚠️ Erreur swap: {e}")
 
 # ==========================================
-# 4. ARBITRAGE (exploite les écarts de prix entre DEX)
+# 6. ARBITRAGE
 # ==========================================
 
 def arbitrage_dex(token_address, amount_usdt):
     try:
-        print(f"🔄 Tentative d'arbitrage sur {token_address[:12]}...")
         quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&outputMint={token_address}&amount={int(amount_usdt * 1_000_000)}&slippageBps=100"
-        quote = requests.get(quote_url).json()
-
-        if 'routePlan' not in quote:
+        quote = requete_robuste(quote_url)
+        if quote is None or 'routePlan' not in quote:
             return
 
         dex_prices = {}
@@ -124,7 +155,6 @@ def arbitrage_dex(token_address, amount_usdt):
             dex_prices[dex_id] = float(price)
 
         if len(dex_prices) < 2:
-            print("⚠️ Pas assez de DEX pour l'arbitrage.")
             return
 
         min_price = min(dex_prices.values())
@@ -133,23 +163,24 @@ def arbitrage_dex(token_address, amount_usdt):
 
         if spread > ARBITRAGE_SEUIL:
             print(f"💰 Spread {spread:.2%} détecté ! Gain potentiel : {amount_usdt * spread:.2f} USDC")
-            # Pour un arbitrage réel, il faudrait deux transactions signées.
-            # Ici, on le signale pour que tu saches qu'une opportunité existe.
         else:
-            print(f"⏳ Spread {spread:.2%} < seuil ({ARBITRAGE_SEUIL*100:.1f}%), pas d'arbitrage.")
+            print(f"⏳ Spread {spread:.2%} < seuil ({ARBITRAGE_SEUIL*100:.1f}%)")
 
     except Exception as e:
         print(f"⚠️ Erreur arbitrage: {e}")
 
 # ==========================================
-# 5. SURVEILLANCE DES BALEINES
+# 7. SURVEILLANCE DES BALEINES
 # ==========================================
 
 def check_whale(whale_address):
     global portefeuille_global
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{whale_address}"
-        data = requests.get(url).json()
+        data = requete_robuste(url)
+        if data is None:
+            print(f"⏳ Baleine {whale_address[:8]}... injoignable, réessai plus tard.")
+            return
 
         if 'trades' not in data or len(data['trades']) == 0:
             return
@@ -166,7 +197,6 @@ def check_whale(whale_address):
             print(f"🐋 {whale_address[:8]}... ACHÈTE {token[:12]} (Vol: {volume:.0f})")
             swap_solana(token, MONTANT_USDC, is_buy=True)
             portefeuille_global[token] = True
-            # Lance l'arbitrage juste après l'achat
             arbitrage_dex(token, ARBITRAGE_MONTANT)
 
         elif side == 'SELL' and token in portefeuille_global:
@@ -178,7 +208,7 @@ def check_whale(whale_address):
         print(f"⚠️ Erreur scan {whale_address[:8]}: {e}")
 
 # ==========================================
-# 6. BOUCLE PRINCIPALE
+# 8. BOUCLE PRINCIPALE
 # ==========================================
 
 if __name__ == "__main__":
